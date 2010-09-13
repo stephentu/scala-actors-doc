@@ -3,7 +3,7 @@
 \usepackage{fullpage}
 
 \title{Scala Actors Documentation}
-\author{Stephen Tu}
+\author{Philipp Haller \and Stephen Tu}
 
 \begin{document}
 
@@ -111,6 +111,51 @@ throwing exceptions. The middle case causes undefined behavior.
 Exception handling for remote actors will be covered in a later section, 
 since there are a few subtleties to be aware of.
 
+\subsubsection{Remote Starting}
+A new feature of remote actors is the ability to programatically start new actors
+running on other JVMs. There are various \verb|remoteStart| methods used to 
+achieve this behavior. By default, the remote start service, or the service
+which listens to incoming requests to start actors, is disable. This is for
+security purposes. To enable a remote start service, simply call 
+\verb|enableRemoteStart|. Then, remote users can simply call \verb|remoteStart|
+with the desired actor class to start. If that class is on your classpath, then
+this will work. Currently, there is no provision for shipping the byte code defining
+a class. An example is as follows:
+\begin{verbatim}
+// on your machine, let's call it gibson
+enableRemoteStart()
+
+// on remote machine (or your own)
+remoteStart[SomeActorClass]("gibson")
+val remotelyStartedActor = select(Node("gibson", 9000), 'someActor)
+remotelyStartedActor ! "Hello, world!"
+\end{verbatim}
+This variant of \verb|remoteStart| is when the named class already makes itself
+a remote actor in its own code. In the example above, we have assumed that
+class \verb|RemoteActorClass| registers itself as \verb|'someActor| on port 
+\verb|9000|. We can use the other variants of \verb|remoteStart| if the
+actor does not register itself:
+\begin{verbatim}
+// on your machine, let's call it gibson again
+enableRemoteStart()
+
+// on remote machine (or your own)
+val remotelyStartedActor = remoteStart[SomeOtherActorClass]("gibson", 9000, 'someActor)
+remotelyStartedActor ! "Hello, world!"
+\end{verbatim}
+Here, \verb|SomeOtherActorClass| does not register itself, but we ask that it be registered
+on port $9000$ as \verb|'someActor|. A \verb|RemoteActor| handle is then returned back to
+us.\\ \\
+There are currently a few limitations with remote start:
+\begin{enumerate}
+  \item The actor being started must be on the classpath of the remote machine
+  \item The actor being started must have a no argument constructor
+\end{enumerate}
+Note that, all \verb|remoteStart| methods are blocking. That is, the invocation does not return
+until a response has been sent back from the remote side, or the timeout period
+(specified in \verb|Configuration|) expires. If the timeout period expires, or
+the remote side responds erroneously, an exception is thrown.
+
 \subsection{Configuration}
 One of the major changes of the remote actors API is the \verb|Configuration| object.
 The method signature for many of the methods in \verb|RemoteActor| take an
@@ -120,7 +165,10 @@ for \verb|alive|:
 def alive(port: Int, actor: Actor)(implicit cfg: Configuration)
 \end{verbatim}
 The default \verb|Configuration| instance used when no explicit instance is specified
-is \\ \verb|scala.actors.remote.Configuration.DefaultConfig|. By looking at the trait
+is \\ \verb|scala.actors.remote.Configuration.DefaultConfig|. The motivation for using
+an implicit parameter was to maintain source compatibility with the pre-existing API, since
+it allowed us to provide a default value, while giving users the ability to use the new features.\\ \\
+By looking at the trait
 definition for \verb|Configuration|, one sees many parameters open for configuration.
 \begin{enumerate}
   \item \verb|aliveMode| - The \verb|ServiceMode| that listeners should use
@@ -246,7 +294,8 @@ command messages that can be sent from a node to another node. These messages ar
 The \verb|Serializer| base class has an abstract method \verb|writeMessageName| for each 
 of these message types. For instance, for \verb|LocateRequest|:
 \begin{verbatim}
-def writeLocateRequest(outputStream: OutputStream, sessionId: Long, receiverName: String): Unit
+def writeLocateRequest(outputStream: OutputStream, 
+    sessionId: Long, receiverName: String): Unit
 \end{verbatim}
 There is also an abstract \verb|read| method which has the following signature:
 \begin{verbatim}
