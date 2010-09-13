@@ -1,0 +1,308 @@
+\documentclass{article}
+%\usepackage{hyperlatex}
+\usepackage{fullpage}
+
+\title{Scala Actors Documentation}
+\author{Stephen Tu}
+
+\begin{document}
+
+\maketitle
+
+\section{Remote Actors}
+This portion describes the newly redesigned remote actors API (since 2.8).
+The API was designed to be fully source compatible, meaning existing remote
+actor programs written should still work (with the same semantics). Note however
+that the redesigned network protocol is not backwards compatible with the previous
+network protocol.
+
+\subsection{RemoteActor}
+The main interface to the remote actor API is the \verb|scala.actos.remote.RemoteActor| object.
+This object provides the necessary means to create and connect to remote actor instances.
+
+\subsubsection{Starting Remote Actors}
+A remote actor is uniquely identified by a \verb|Symbol|. This symbol is unique to the 
+JVM instance. The two idioms to create a remote actor identified with name \verb|myActor|
+are as follows. Note for all code snippets shown below, assume the following imports:
+\begin{verbatim}
+import scala.actors._
+import scala.actors.Actor._
+import scala.actors.remote._
+import scala.actors.remote.RemoteActor._
+\end{verbatim}
+The anonymous syntax for creation is similiar to the \verb|actor| syntax:
+\begin{verbatim}
+val myActor = remoteActor(9000, 'myActor) {
+  loop {
+    react {
+      case e => 
+        sender ! e // an echo actor
+    }
+  }
+}
+\end{verbatim}
+Explicit actor classes can be made remote as follows (this is also shown in the Scaladoc):
+\begin{verbatim}
+// same imports as before
+class MyActor extends Actor {
+  def act() {
+    alive(9000)
+    register(self, 'myActor)
+    // actor behavior
+  }
+}
+\end{verbatim}
+Note that a name can only be registered to a single (alive) actor at a time.
+For example, if one wants to register actor $A$ as \verb|myActor|, and then register
+another actor $B$ as \verb|myActor|, one would have to wait until $A$ terminated,
+or explicitly call \verb|unregister|, passing in actor $A$. This requirement
+applies across all ports, so simply registering $B$ on a different port as $A$
+is not sufficient.
+
+\subsubsection{Connecting to Remote Actors}
+Connecting to a remote actor created by the means described previously is also
+just as simple. \verb|RemoteActor| defines a type alias called \verb|RemoteProxy|. 
+This is a representation of a remote actor handle, which is returned by calls to
+various methods in \verb|RemoteActor|, including \verb|select|. To connect
+to a remote actor running on machine with address \verb|myMachine|, on port \verb|8000|,
+with name \verb|aActor|, use \verb|select|\footnote{
+  Note that \texttt{select} should be called within an actor. To select a remote actor
+  outside of an actor, use \texttt{remoteActorAt}, which has a method signature
+  identical to \texttt{select}. The difference between \texttt{select} and \texttt{remoteActorAt}
+  is that \texttt{select} uses the thread local \texttt{scala.actors.Actor.self} to 
+  register a termination handler in the network kernel, so that when all actors shut down,
+  the network kernel can release its internel thread pools, and the JVM can exit properly.
+  However, if called outside of an actor, \texttt{Actor.self} returns an actor proxy for the
+  current thread, which never invokes its termination handlers. Consequently, the network
+  kernel never gets notified when the thread terminates, does not release its resources, and
+  the JVM keeps on running. \texttt{remoteActorAt} gets around this by simply not registering
+  any termination handlers, so the current thread does not prevent the network kernel
+  from shutting down.
+}
+in the following manner:
+\begin{verbatim}
+val aActor = select(Node("myMachine", 8000), 'aActor)
+\end{verbatim}
+The returned actor from \verb|select| has the same interface as a regular actor, and thus
+can be used as such:
+\begin{verbatim}
+aActor ! "Hello, aActor!"
+receive {
+  case response => println("Response: " + response)
+}
+aActor !? "What is the meaning of life?" match {
+  case 42   => println("Success")
+  case oops => println("Failed: " + oops)
+}
+val ftch = aActor !! "What is the last digit of PI?"
+// stash ftch away to be invoked (much) later
+\end{verbatim}
+Note that both \verb|select| and \verb|remoteActorAt| are lazy; they do not actually initiate any
+network connections. They simple create a new \verb|RemoteActor| instance which is ready
+to initiate a new network connection when needed (for instance, when \verb|!| is invoked). 
+When a new connection is initiated, there are three potential sources of error:
+\begin{enumerate}
+  \item The TCP connection cannot be made (bad address, bad port, etc)
+  \item The remote end does not speak the remote actors protocol, 
+  \item The remote actor named does not exist remotely
+\end{enumerate}
+The current implementation only handles the first and last error cases gracefully, by 
+throwing exceptions. The middle case causes undefined behavior.
+Exception handling for remote actors will be covered in a later section, 
+since there are a few subtleties to be aware of.
+
+\subsection{Configuration}
+One of the major changes of the remote actors API is the \verb|Configuration| object.
+The method signature for many of the methods in \verb|RemoteActor| take an
+implicit \verb|Configuration| instance. For instance, consider the signature
+for \verb|alive|:
+\begin{verbatim}
+def alive(port: Int, actor: Actor)(implicit cfg: Configuration)
+\end{verbatim}
+The default \verb|Configuration| instance used when no explicit instance is specified
+is \\ \verb|scala.actors.remote.Configuration.DefaultConfig|. By looking at the trait
+definition for \verb|Configuration|, one sees many parameters open for configuration.
+\begin{enumerate}
+  \item \verb|aliveMode| - The \verb|ServiceMode| that listeners should use
+  \item \verb|selectMode| - The \verb|ServiceMode| that \verb|RemoteActor| instances should use
+  \item \verb|lookupValidPeriod| - The time (in milliseconds) to cache a lookup for a particular 
+    remote actor on a machine.
+  \item \verb|waitTimeout| - How long the network kernel should wait up to for any blocking operations.
+    Right now, this is only used by the various \verb|remoteStart| methods to determine how long
+    to wait up to for a response.
+  \item \verb|newSerializer| - A new \verb|Serializer| instance to use for a new connection. 
+    Read the section on \verb|Serializer| instances to understand how this is used. The
+    default is Java serialization.
+  \item \verb|newMessageCreator| - A new \verb|MessageCreator| instance to use for a new connection.
+    Read the section on \verb|Serializer| instances to understand how this is used.
+  \item \verb|numRetries| - How many times a particular \verb|RemoteActor| should retry to deliver a message
+    until it determines the endpoint is not reachable and throws an error.
+  \item \verb|classLoader| - The class loader to use whenever a new instance of a class is needed (via reflection). 
+    Currently only used by the network kernel to create a new actor (via \verb|remoteStart|).
+\end{enumerate}
+It is simple to use a custom \verb|Configuration| instance via implicit values:
+\begin{verbatim}
+implicit val mySpecialConfig = new DefaultConfiguration {
+  override val aliveMode = ServiceMode.NonBlocking
+  override val selectMode = ServiceMode.NonBlocking 
+}
+val fooActor = select(Node(9000), 'fooActor) // uses mySpecialConfig via an implicit parameter
+\end{verbatim}
+Most of the options have reasonable default values, but the two that do not are \verb|aliveMode| and
+\verb|selectMode|. 
+
+\subsubsection{Service Modes}
+What exactly is a service mode? It is an enumeration which takes on two values (\verb|Blocking| and \verb|NonBlocking|),
+and defines which mode the network kernel should operate in. \verb|Blocking| corresponds to 
+using a traditional one thread per connection model, backed by implementations found in 
+\verb|java.io.*|. \verb|NonBlocking| corresponds to using a single thread\footnote{
+  While in theory a single thread is sufficient for NIO, the actual implementation
+  maintains a thread pool of size $2N_{cpu}$, where each thread runs a selector. Incoming
+  connections are then assigned in round-robin fashion a selector thread. This in theory
+  allows greater scalability. %TODO: cite some blog post about this
+}
+to multiplex IO channels, backed by implementations found in \verb|java.nio.*|. The mode that
+one uses depends on the application at hand, and only proper profiling can really answer the
+question. As a general rule of thumb however, \verb|Blocking| mode is better suited for 
+lower traffic applications (where the number of connections between nodes is not expected
+to exceed $1000$), and \verb|NonBlocking| mode is better suited when a large number of
+concurrent connections between nodes is expected. Additionally, even though the option of placing
+both \verb|aliveMode| and \verb|selectMode| in \verb|NonBlocking| mode is given, in most 
+cases when \verb|NonBlocking| is desirable, it really means \verb|NonBlocking| is desirable for
+the \verb|aliveMode|, since running client connections in NIO mode does not really give as many
+of the benefits as running a server socket in NIO mode.
+
+\subsection{Serializer}
+Another new addition to the remote actors API is the ability to use custom serializers
+to handle the serialization of messages into byte streams. By default, a serializer which
+uses Java serialization is used, because this provides the most flexibility (all primitives work,
+Strings, Lists, Tuples, etc). However, Java serialization is known to be slower than most
+specialized serialization frameworks on the JVM\footnote{\texttt{http://wiki.github.com/eishay/jvm-serializers}}
+(since it tries to reconstruct the object graph as accurately as possible). Thus, if you want
+to take advantage of one of these faster serialization frameworks, then defining a
+custom \verb|Serializer| is the way to go. Doing so, however, requires a proper understanding
+of the remote actor network protocol.
+
+\subsubsection{Serializer Identification}
+Each serializer must supply a \verb|uniqueId| value, which is intended to uniquely identify the
+serializer on the network. The reason for this is, since serializers can be swapped out, when
+a connection is established, one wants to be sure with reasonable confidence that the other
+side can understand the byte streams being sent, and vice versa. Thus, serializers all contain
+a \verb|uniqueId| field, which is sent in the default handshake protocol and compared.
+
+\subsubsection{Handshaking}
+Each network connection is tied to a serializer instance. 
+When the network kernel establishes a TCP connection, it calls back to the serializer to ask it if
+it wants to engage in a handshake with the other side. This is determined by the
+\verb|isHandshaking| value. If this value is set to \verb|true|, then the
+network kernel repeatedly invokes its \verb|handleNextEvent| method to engage in a handshake
+with the remote end. The method signature for \verb|handleNextEvent| is given as:
+\begin{verbatim}
+def handleNextEvent: PartialFunction[ReceivableEvent, Option[TriggerableEvent]]
+\end{verbatim}
+The Scaladoc for \verb|handleNextEvent| explains nicely how the method is invoked.
+The idea here is that two sides of the connection exchange primitive messages back and forth
+to set up some agreement on how to communicate. By default, this handshake simply exchanges
+IDs to make sure they are equal. This is implemented as follows, as a reusable mix-in:
+\begin{verbatim}
+trait IdResolvingSerializer { _: Serializer =>
+  override val isHandshaking = true        
+  override def handleNextEvent: PartialFunction[ReceivableEvent, Option[TriggerableEvent]] = {                        
+    case StartEvent(_)                     => Some(SendEvent(uniqueId))
+    case RecvEvent(id) if (id == uniqueId) => Some(Success)                                                           
+    case RecvEvent(id)                     => 
+      Some(Error("ID's do not match. Expected " + uniqueId + ", but got " + id))     
+  }                                                                                                                   
+}
+\end{verbatim}
+More complicated handshakes can be implemented. For instance, it is possible to
+express a schema resolution handshake in this framework, so that when both sides
+have slightly differing views of the world (in terms of message schemas), they 
+can negotiate a translation mechanism, instead of just failing. Note that,
+messages that can be passed remotely during a handshake are restricted to primitives,
+strings, and byte arrays. This error is only detected at runtime, however. The
+reason for this is because usually when serializers are handshaking, it is because
+they are not aware of how to communicate with each other- thus a pre-defined bootstrap
+format must be used, which is defined in \verb|PrimitiveSerializer|. \\ \\
+If a handshake fails, that is, if an \verb|Error| event is returned from
+an invocation to \verb|handleNextEvent|, the network kernel propagates this up the
+call stack as an exception.
+
+\subsubsection{Wire Format}
+Once the handshake process has succeeded, serializers then proceed to communicate
+via a predefined wire format. Specifically, there are a fixed set of first-class
+command messages that can be sent from a node to another node. These messages are:
+\begin{enumerate}
+  \item \verb|LocateRequest| - Sent to inquire the remote end if an actor with a specific
+    name exists.
+  \item \verb|LocateResponse| - A response to a \verb|LocateRequest|.
+  \item \verb|AsyncSend| - Sent for an asynchronous message, that is, any message
+    sent via \verb|!|.
+  \item \verb|SyncSend| - Sent for a synchronous message, that is, any message sent
+    via \verb|!!| or \verb|!?|.
+  \item \verb|SyncReply| - A response to a \verb|SyncSend|.
+  \item \verb|RemoteApply| - Used to implement \verb|link| and \verb|unlink|.
+\end{enumerate}
+The \verb|Serializer| base class has an abstract method \verb|writeMessageName| for each 
+of these message types. For instance, for \verb|LocateRequest|:
+\begin{verbatim}
+def writeLocateRequest(outputStream: OutputStream, sessionId: Long, receiverName: String): Unit
+\end{verbatim}
+There is also an abstract \verb|read| method which has the following signature:
+\begin{verbatim}
+def read(inputStream: InputStream): NetKernelMessage
+\end{verbatim}
+Thus, this suggests that a \verb|Serializer| is free to choose any binary format to write the message,
+and as long as the \verb|read| method can decode the binary format and somehow produce a 
+\verb|NetKernelMessage| instance, then the network kernel does not care how this happened.
+This is exactly the case, and is done intentionally to give writers of \verb|Serializer|s the most
+flexibility.\\ \\
+The default \verb|JavaSerializer| implements this by first writing a tag (byte) which is associated
+with each of the messages, followed by the meta data fields, and then the message.
+
+\subsubsection{An Example: GZip Serializer}
+To make this more concrete, here is an example of a \verb|Serializer| which wraps an underlying
+\verb|Serializer| and does GZip compression on the byte streams. For the GZip compression,
+we will simply use the one defined in \verb|java.util.zip.GZIPOutputStream|.
+\begin{verbatim}
+class GZipSerializer(val underlying: Serializer) extends Serializer {
+  override val uniqueId = 228081497L
+  override val isHandshaking = true
+
+  private var node: Node = _
+  private var underlyingStarted = false
+
+  type HandshakePF = PartialFunction[ReceivableEvent, Option[TriggerableEvent]]
+
+  override def handleNextEvent: HandshakePF = {
+    case StartEvent(n) =>
+      node = n
+      Some(SendEvent(uniqueId))
+    case RecvEvent(msg) if (!underlyingStarted) =>
+      if (msg != uniqueId)
+        Some(Error("Did not send expected uniqueId"))
+      else
+        underlyingStarted = true
+        underlying.handleNextEvent(StartEvent(node))
+    case e if (underlyingStarted) =>
+      underlying.handleNextEvent(e)
+  }
+
+  override def writeLocateRequest(outputStream: OutputStream, 
+      sessionId: Long, receiverName: String) {
+    val gos = new GZIPOutputStream(outputStream)
+    underlying.writeLocateRequest(gos, sessionId, receiverName)
+    gos.finish()
+  }
+
+  // very similar write methods omitted for the remaining message types
+
+  override def read(bytes: InputStream) =
+    underlying.read(new GZIPInputStream(bytes))
+}
+\end{verbatim}
+
+
+
+\end{document}
+
